@@ -5,6 +5,11 @@ use alloc::vec::Vec;
 // Here we declare the runtime API. It is implemented it the `impl` block in
 // src/neuron_info.rs, src/subnet_info.rs, and src/delegate_info.rs
 sp_api::decl_runtime_apis! {
+    
+    pub trait EpochInfoRuntimeApi {
+        fn subtensor_epoch(netuid: u16, incentive: Option<bool>) -> Vec<u8>;
+    }
+
     pub trait DelegateInfoRuntimeApi {
         fn get_delegates() -> Vec<u8>;
         fn get_delegate( delegate_account_vec: Vec<u8> ) -> Vec<u8>;

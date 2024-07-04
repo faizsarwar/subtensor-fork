@@ -1,10 +1,10 @@
 use super::*;
 use frame_support::storage::IterableStorageDoubleMap;
 use frame_support::storage::IterableStorageMap;
-use sp_runtime::Saturating;
 use substrate_fixed::types::I110F18;
 use substrate_fixed::types::I64F64;
 use substrate_fixed::types::I96F32;
+use epoch;
 
 impl<T: Config> Pallet<T> {
     /// Executes the necessary operations for each block.
@@ -28,7 +28,6 @@ impl<T: Config> Pallet<T> {
         Ok(())
     }
 
-    #[allow(clippy::arithmetic_side_effects)]
     /// Helper function which returns the number of blocks remaining before we will run the epoch on this
     /// network. Networks run their epoch when (block_number + netuid + 1 ) % (tempo + 1) = 0
     ///
@@ -44,13 +43,9 @@ impl<T: Config> Pallet<T> {
         if tempo == 0 {
             return 1000;
         }
-        (tempo as u64).saturating_sub(
-            block_number.saturating_add(netuid as u64).saturating_add(1)
-                % (tempo as u64).saturating_add(1),
-        )
+        tempo as u64 - (block_number + netuid as u64 + 1) % (tempo as u64 + 1)
     }
 
-    #[allow(clippy::arithmetic_side_effects)]
     /// Helper function returns the number of tuples to drain on a particular step based on
     /// the remaining tuples to sink and the block number
     ///
@@ -61,20 +56,18 @@ impl<T: Config> Pallet<T> {
         n_remaining: usize,
     ) -> usize {
         let blocks_until_epoch: u64 = Self::blocks_until_next_epoch(netuid, tempo, block_number);
-        if blocks_until_epoch.saturating_div(2) == 0 {
+        if blocks_until_epoch / 2 == 0 {
             return n_remaining;
         } // drain all.
-        if tempo.saturating_div(2) == 0 {
+        if tempo / 2 == 0 {
             return n_remaining;
         } // drain all
         if n_remaining == 0 {
             return 0;
         } // nothing to drain at all.
           // Else return enough tuples to drain all within half the epoch length.
-        let to_sink_via_tempo: usize =
-            n_remaining.saturating_div((tempo as usize).saturating_div(2));
-        let to_sink_via_blocks_until_epoch: usize =
-            n_remaining.saturating_div((blocks_until_epoch as usize).saturating_div(2));
+        let to_sink_via_tempo: usize = n_remaining / (tempo as usize / 2);
+        let to_sink_via_blocks_until_epoch: usize = n_remaining / (blocks_until_epoch as usize / 2);
         if to_sink_via_tempo > to_sink_via_blocks_until_epoch {
             to_sink_via_tempo
         } else {
@@ -103,7 +96,7 @@ impl<T: Config> Pallet<T> {
                     *server_amount,
                     *validator_amount,
                 );
-                total_emitted.saturating_accrue((*server_amount).saturating_add(*validator_amount));
+                total_emitted += *server_amount + *validator_amount;
             }
             LoadedEmission::<T>::remove(netuid);
             TotalIssuance::<T>::put(TotalIssuance::<T>::get().saturating_add(total_emitted));
@@ -118,17 +111,13 @@ impl<T: Config> Pallet<T> {
         // --- 1. Iterate across each network and add pending emission into stash.
         for (netuid, tempo) in <Tempo<T> as IterableStorageMap<u16, u16>>::iter() {
             // Skip the root network or subnets with registrations turned off
-            if netuid == Self::get_root_netuid() {
+            if netuid == Self::get_root_netuid() || !Self::is_registration_allowed(netuid) {
                 // Root emission or subnet emission is burned
                 continue;
             }
 
             // --- 2. Queue the emission due to this network.
-            let mut new_queued_emission: u64 = Self::get_subnet_emission_value(netuid);
-            if !Self::is_registration_allowed(netuid) {
-                new_queued_emission = 0; // No emission for this network if registration is off.
-            }
-
+            let new_queued_emission: u64 = Self::get_subnet_emission_value(netuid);
             log::debug!(
                 "generate_emission for netuid: {:?} with tempo: {:?} and emission: {:?}",
                 netuid,
@@ -154,9 +143,7 @@ impl<T: Config> Pallet<T> {
                 Self::coinbase(cut.to_num::<u64>());
             }
             // --- 5. Add remaining amount to the network's pending emission.
-            PendingEmission::<T>::mutate(netuid, |queued| {
-                queued.saturating_accrue(remaining.to_num::<u64>())
-            });
+            PendingEmission::<T>::mutate(netuid, |queued| *queued += remaining.to_num::<u64>());
             log::debug!(
                 "netuid_i: {:?} queued_emission: +{:?} ",
                 netuid,
@@ -168,7 +155,7 @@ impl<T: Config> Pallet<T> {
                 // --- 3.1 No epoch, increase blocks since last step and continue,
                 Self::set_blocks_since_last_step(
                     netuid,
-                    Self::get_blocks_since_last_step(netuid).saturating_add(1),
+                    Self::get_blocks_since_last_step(netuid) + 1,
                 );
                 continue;
             }
@@ -180,7 +167,15 @@ impl<T: Config> Pallet<T> {
 
             // --- 8. Run the epoch mechanism and return emission tuples for hotkeys in the network.
             let emission_tuples_this_block: Vec<(T::AccountId, u64, u64)> =
-                Self::epoch(netuid, emission_to_drain);
+                match Self::epoch(netuid, None) {
+                    epoch::EpochRetunType::Epoch(vec) => vec,
+                    epoch::EpochRetunType::Incentive(_) => {
+                        // Handle the case where the result is `Incentive`
+                        // For this example, we'll return an empty vector or handle it as needed
+                        vec![]
+                    }
+                };
+
             log::debug!(
                 "netuid_i: {:?} emission_to_drain: {:?} ",
                 netuid,
@@ -190,7 +185,7 @@ impl<T: Config> Pallet<T> {
             // --- 9. Check that the emission does not exceed the allowed total.
             let emission_sum: u128 = emission_tuples_this_block
                 .iter()
-                .map(|(_account_id, ve, se)| (*ve as u128).saturating_add(*se as u128))
+                .map(|(_account_id, ve, se)| *ve as u128 + *se as u128)
                 .sum();
             if emission_sum > emission_to_drain as u128 {
                 continue;
@@ -222,10 +217,7 @@ impl<T: Config> Pallet<T> {
         // --- 1. Check if the hotkey is a delegate. If not, we simply pass the stake through to the
         // coldkey - hotkey account as normal.
         if !Self::hotkey_is_delegate(hotkey) {
-            Self::increase_stake_on_hotkey_account(
-                hotkey,
-                server_emission.saturating_add(validator_emission),
-            );
+            Self::increase_stake_on_hotkey_account(hotkey, server_emission + validator_emission);
             return;
         }
         // Then this is a delegate, we distribute validator_emission, then server_emission.
@@ -235,7 +227,7 @@ impl<T: Config> Pallet<T> {
         let total_hotkey_stake: u64 = Self::get_total_stake_for_hotkey(hotkey);
         let delegate_take: u64 =
             Self::calculate_delegate_proportional_take(hotkey, validator_emission);
-        let validator_emission_minus_take: u64 = validator_emission.saturating_sub(delegate_take);
+        let validator_emission_minus_take: u64 = validator_emission - delegate_take;
         let mut remaining_validator_emission: u64 = validator_emission_minus_take;
 
         // 3. -- The remaining emission goes to the owners in proportion to the stake delegated.
@@ -261,14 +253,14 @@ impl<T: Config> Pallet<T> {
                 hotkey,
                 stake_proportion
             );
-            remaining_validator_emission.saturating_reduce(stake_proportion);
+            remaining_validator_emission -= stake_proportion;
         }
 
         // --- 5. Last increase final account balance of delegate after 4, since 5 will change the stake proportion of
         // the delegate and effect calculation in 4.
         Self::increase_stake_on_hotkey_account(
             hotkey,
-            delegate_take.saturating_add(remaining_validator_emission),
+            delegate_take + remaining_validator_emission,
         );
         log::debug!("delkey: {:?} delegate_take: +{:?} ", hotkey, delegate_take);
         // Also emit the server_emission to the hotkey
@@ -328,10 +320,8 @@ impl<T: Config> Pallet<T> {
         if total_stake == 0 {
             return 0;
         };
-        let stake_proportion: I64F64 =
-            I64F64::from_num(stake).saturating_div(I64F64::from_num(total_stake));
-        let proportional_emission: I64F64 =
-            I64F64::from_num(emission).saturating_mul(stake_proportion);
+        let stake_proportion: I64F64 = I64F64::from_num(stake) / I64F64::from_num(total_stake);
+        let proportional_emission: I64F64 = I64F64::from_num(emission) * stake_proportion;
         proportional_emission.to_num::<u64>()
     }
 
@@ -339,9 +329,9 @@ impl<T: Config> Pallet<T> {
     ///
     pub fn calculate_delegate_proportional_take(hotkey: &T::AccountId, emission: u64) -> u64 {
         if Self::hotkey_is_delegate(hotkey) {
-            let take_proportion: I64F64 = I64F64::from_num(Delegates::<T>::get(hotkey))
-                .saturating_div(I64F64::from_num(u16::MAX));
-            let take_emission: I64F64 = take_proportion.saturating_mul(I64F64::from_num(emission));
+            let take_proportion: I64F64 =
+                I64F64::from_num(Delegates::<T>::get(hotkey)) / I64F64::from_num(u16::MAX);
+            let take_emission: I64F64 = take_proportion * I64F64::from_num(emission);
             take_emission.to_num::<u64>()
         } else {
             0
@@ -368,7 +358,7 @@ impl<T: Config> Pallet<T> {
 
             // --- 3. Check if we are at the adjustment interval for this network.
             // If so, we need to adjust the registration difficulty based on target and actual registrations.
-            if current_block.saturating_sub(last_adjustment_block) >= adjustment_interval as u64 {
+            if (current_block - last_adjustment_block) >= adjustment_interval as u64 {
                 log::debug!("interval reached.");
 
                 // --- 4. Get the current counters for this network w.r.t burn and difficulty values.
@@ -515,21 +505,14 @@ impl<T: Config> Pallet<T> {
         target_registrations_per_interval: u16,
     ) -> u64 {
         let updated_difficulty: I110F18 = I110F18::from_num(current_difficulty)
-            .saturating_mul(I110F18::from_num(
-                registrations_this_interval.saturating_add(target_registrations_per_interval),
-            ))
-            .saturating_div(I110F18::from_num(
-                target_registrations_per_interval.saturating_add(target_registrations_per_interval),
-            ));
-        let alpha: I110F18 = I110F18::from_num(Self::get_adjustment_alpha(netuid))
-            .saturating_div(I110F18::from_num(u64::MAX));
-        let next_value: I110F18 = alpha
-            .saturating_mul(I110F18::from_num(current_difficulty))
-            .saturating_add(
-                I110F18::from_num(1.0)
-                    .saturating_sub(alpha)
-                    .saturating_mul(updated_difficulty),
+            * I110F18::from_num(registrations_this_interval + target_registrations_per_interval)
+            / I110F18::from_num(
+                target_registrations_per_interval + target_registrations_per_interval,
             );
+        let alpha: I110F18 =
+            I110F18::from_num(Self::get_adjustment_alpha(netuid)) / I110F18::from_num(u64::MAX);
+        let next_value: I110F18 = alpha * I110F18::from_num(current_difficulty)
+            + (I110F18::from_num(1.0) - alpha) * updated_difficulty;
         if next_value >= I110F18::from_num(Self::get_max_difficulty(netuid)) {
             Self::get_max_difficulty(netuid)
         } else if next_value <= I110F18::from_num(Self::get_min_difficulty(netuid)) {
@@ -549,21 +532,14 @@ impl<T: Config> Pallet<T> {
         target_registrations_per_interval: u16,
     ) -> u64 {
         let updated_burn: I110F18 = I110F18::from_num(current_burn)
-            .saturating_mul(I110F18::from_num(
-                registrations_this_interval.saturating_add(target_registrations_per_interval),
-            ))
-            .saturating_div(I110F18::from_num(
-                target_registrations_per_interval.saturating_add(target_registrations_per_interval),
-            ));
-        let alpha: I110F18 = I110F18::from_num(Self::get_adjustment_alpha(netuid))
-            .saturating_div(I110F18::from_num(u64::MAX));
-        let next_value: I110F18 = alpha
-            .saturating_mul(I110F18::from_num(current_burn))
-            .saturating_add(
-                I110F18::from_num(1.0)
-                    .saturating_sub(alpha)
-                    .saturating_mul(updated_burn),
+            * I110F18::from_num(registrations_this_interval + target_registrations_per_interval)
+            / I110F18::from_num(
+                target_registrations_per_interval + target_registrations_per_interval,
             );
+        let alpha: I110F18 =
+            I110F18::from_num(Self::get_adjustment_alpha(netuid)) / I110F18::from_num(u64::MAX);
+        let next_value: I110F18 = alpha * I110F18::from_num(current_burn)
+            + (I110F18::from_num(1.0) - alpha) * updated_burn;
         if next_value >= I110F18::from_num(Self::get_max_burn_as_u64(netuid)) {
             Self::get_max_burn_as_u64(netuid)
         } else if next_value <= I110F18::from_num(Self::get_min_burn_as_u64(netuid)) {
